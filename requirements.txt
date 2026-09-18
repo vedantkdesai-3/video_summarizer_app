@@ -1,0 +1,9 @@
+gradio>=6
+transformers>=5
+torch
+bert-extractive-summarizer
+imageio-ffmpeg
+numpy
+pandas
+yt-dlp[default]
+mlx-whisper; platform_system == "Darwin" and platform_machine == "arm64"
