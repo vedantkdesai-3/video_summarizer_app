@@ -1,0 +1,21 @@
+# Root-level runtime folders
+/workspace/
+/venv_project/
+/.venv/
+/venv/
+
+# Python cache folders
+/__pycache__/
+
+# IDE folders
+/.vscode/
+/.idea/
+
+# Generated/downloaded folders
+/downloads/
+/jobs/
+/renders/
+/thumbs/
+
+# Environment file
+/.env
