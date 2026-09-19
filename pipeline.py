@@ -12,7 +12,6 @@ Every long step takes a `progress(fraction, description)` callback.
 from __future__ import annotations
 
 import bisect
-import contextlib
 import hashlib
 import json
 import os
@@ -170,6 +169,65 @@ def set_title(job: Job, title: str) -> Job:
     return job
 
 
+def extract_audio_features(job: Job, progress: ProgressFn = _no_progress) -> dict:
+    """Extract common audio features with Librosa and cache them per video."""
+    if not job.has_audio:
+        raise ValueError("This video has no audio track, so audio features cannot be extracted.")
+
+    cache = job.work_dir / "audio_features_librosa.json"
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            data["cached"] = True
+            progress(1.0, "Audio features loaded from cache")
+            return data
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    import librosa
+
+    progress(0.05, "Extracting audio for Librosa")
+    audio = load_audio_16k(job.video_path)
+    sr = 16000
+    if audio.size == 0:
+        raise ValueError("The audio track is empty.")
+
+    progress(0.25, "Computing Librosa features")
+    # Use a consistent sample rate and mono signal so features are comparable across videos.
+    n_fft = 2048
+    hop_length = 512
+    rms = librosa.feature.rms(y=audio, frame_length=n_fft, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(audio, frame_length=n_fft, hop_length=hop_length)[0]
+    centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)[0]
+    bandwidth = librosa.feature.spectral_bandwidth(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)[0]
+    rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)[0]
+    chroma = librosa.feature.chroma_stft(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length)
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop_length)
+
+    progress(0.70, "Estimating tempo")
+    tempo = float(librosa.feature.tempo(y=audio, sr=sr, hop_length=hop_length)[0])
+
+    data = {
+        "library": "librosa",
+        "sample_rate": sr,
+        "duration_seconds": float(len(audio) / sr),
+        "rms_mean": float(rms.mean()),
+        "rms_std": float(rms.std()),
+        "zero_crossing_rate_mean": float(zcr.mean()),
+        "spectral_centroid_hz": float(centroid.mean()),
+        "spectral_bandwidth_hz": float(bandwidth.mean()),
+        "spectral_rolloff_hz": float(rolloff.mean()),
+        "tempo_bpm": tempo,
+        "chroma_mean": [float(x) for x in chroma.mean(axis=1)],
+        "mfcc_mean": [float(x) for x in mfcc.mean(axis=1)],
+        "mfcc_std": [float(x) for x in mfcc.std(axis=1)],
+        "cached": False,
+    }
+    cache.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    progress(1.0, "Audio features ready")
+    return data
+
+
 def source_thumbnail(job: Job) -> Path:
     return extract_frame(job.video_path, job.duration * 0.1, job.work_dir / "thumbs" / "source.jpg", width=640)
 
@@ -261,48 +319,16 @@ def download_url(url: str, max_height: int = 720, progress: ProgressFn = _no_pro
 
 
 # ----------------------------------------------------------------------------- Transcription
-@contextlib.contextmanager
-def _whisper_progress(progress: ProgressFn, base: float = 0.10, span: float = 0.88):
-    """Report mlx-whisper's own progress bar as a single, clean progress value.
-
-    mlx-whisper (and the model downloader) create several tqdm bars. Letting Gradio track tqdm draws
-    them all in one place, on top of each other, so we read the transcription bar ourselves instead.
-    """
-    try:
-        import tqdm as tqdm_module
-    except Exception:
-        yield
-        return
-    original = tqdm_module.tqdm
-
-    class Reporting(original):
-        def update(self, n=1):
-            super().update(n)
-            try:
-                if self.total:
-                    done = min(1.0, self.n / self.total)
-                    progress(base + span * done, f"Transcribing {done:.0%}")
-            except Exception:
-                pass
-
-    tqdm_module.tqdm = Reporting          # mlx-whisper calls tqdm.tqdm(...) at run time
-    try:
-        yield
-    finally:
-        tqdm_module.tqdm = original
-
-
-def _transcribe_mlx(audio, repo, language, progress: ProgressFn = _no_progress):
+def _transcribe_mlx(audio, repo, language):
     import mlx_whisper
-    with _whisper_progress(progress):
-        res = mlx_whisper.transcribe(audio, path_or_hf_repo=repo, word_timestamps=True, language=language,
-                                     condition_on_previous_text=False, verbose=False)
+    res = mlx_whisper.transcribe(audio, path_or_hf_repo=repo, word_timestamps=True, language=language,
+                                 condition_on_previous_text=False, verbose=False)   # verbose=False -> tqdm bar
     chunks = [{"text": w["word"], "timestamp": [float(w["start"]), float(w["end"])]}
               for seg in res["segments"] for w in seg.get("words", [])]
     return res["text"].strip(), chunks
 
 
-def _transcribe_hf(audio, repo, language, progress: ProgressFn = _no_progress):
+def _transcribe_hf(audio, repo, language):
     import torch
     from transformers import pipeline
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -331,8 +357,7 @@ def prepare(job: Job, whisper_choice: str, language: Optional[str], progress: Pr
             audio = load_audio_16k(job.video_path)
             progress(0.08, f"Transcribing {len(audio) / 16000 / 60:.1f} min of audio with {repo.split('/')[-1]}"
                            " (first run downloads the model)")
-            text, chunks = (_transcribe_mlx if IS_APPLE_SILICON else _transcribe_hf)(
-                audio, repo, language, progress)
+            text, chunks = (_transcribe_mlx if IS_APPLE_SILICON else _transcribe_hf)(audio, repo, language)
             data = {"text": text, "chunks": chunks}
             cache.write_text(json.dumps(data))
             cached = False

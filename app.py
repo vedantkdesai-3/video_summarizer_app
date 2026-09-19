@@ -404,8 +404,13 @@ def on_open_video(video_ids, row_index, project_id, request: gr.Request):
 def on_delete_video(video_ids, row_index, confirm, project_id, query, request: gr.Request):
     user_id, username = _user(request)
     video_id = _selected_id(video_ids, row_index, "videos")
-    if not confirm:
-        raise gr.Error("Tick 'Confirm delete' first.")
+    if not bool(confirm):
+        # Keep the UI intact and show a normal in-app warning instead of
+        # raising an exception that appears as a traceback in the server log.
+        frame, ids = _videos_frame(project_id, query)
+        return (frame, ids, row_index, False, _session_line(user_id, username),
+                "⚠️ Please tick **Confirm delete** before removing the selected video.",
+                gr.update())
     row = db.get_video(video_id, user_id)
     try:
         db.delete_video(video_id, user_id)
@@ -474,6 +479,35 @@ def on_process(job_id, video_id, whisper_choice, language_name, request: gr.Requ
             f"**{language or 'auto-detect'}**.",
             job.full_text, gr.update(interactive=True),
             _transcripts_frame(video_id), _session_line(user_id, username))
+
+
+def on_audio_features(job_id, progress=gr.Progress()):
+    if not job_id:
+        raise gr.Error("Open a video first, on the Videos screen.")
+    try:
+        job = P.get_job(job_id)
+        features = P.extract_audio_features(job, progress=lambda f, d="": progress(f, desc=d))
+    except Exception as ex:
+        raise gr.Error(str(ex))
+
+    rows = [
+        ["Sample rate", f"{features['sample_rate']:,} Hz"],
+        ["Duration", P.fmt_time(features["duration_seconds"])],
+        ["RMS energy (mean)", f"{features['rms_mean']:.6f}"],
+        ["RMS energy (std)", f"{features['rms_std']:.6f}"],
+        ["Zero-crossing rate", f"{features['zero_crossing_rate_mean']:.6f}"],
+        ["Spectral centroid", f"{features['spectral_centroid_hz']:.2f} Hz"],
+        ["Spectral bandwidth", f"{features['spectral_bandwidth_hz']:.2f} Hz"],
+        ["Spectral rolloff", f"{features['spectral_rolloff_hz']:.2f} Hz"],
+        ["Tempo", f"{features['tempo_bpm']:.2f} BPM"],
+    ]
+    for i, value in enumerate(features["mfcc_mean"], 1):
+        rows.append([f"MFCC {i} (mean)", f"{value:.6f}"])
+    for i, value in enumerate(features["chroma_mean"], 1):
+        rows.append([f"Chroma {i} (mean)", f"{value:.6f}"])
+
+    status = "Loaded from cache." if features.get("cached") else "Computed with Librosa and cached for this video."
+    return rows, f"**Audio features ready.** {status}"
 
 
 def apply_preset(name):
@@ -1414,6 +1448,24 @@ with gr.Blocks(title="Video Summarizer") as demo:
                     elem_classes="vs-table",
                 )
 
+                with gr.Accordion("Audio Features · Librosa", open=False):
+                    gr.Markdown(
+                        "Extract MFCC, chroma, RMS energy, zero-crossing rate, spectral centroid, "
+                        "bandwidth, rolloff and tempo from the video's audio.",
+                        elem_classes="vs-note",
+                    )
+                    audio_features_btn = gr.Button("🎵 Analyze audio features", variant="secondary")
+                    audio_features_status = gr.Markdown()
+                    audio_features_table = gr.Dataframe(
+                        headers=["Feature", "Value"],
+                        datatype=["str", "str"],
+                        interactive=False,
+                        wrap=True,
+                        max_height=520,
+                        show_label=False,
+                        elem_classes="vs-table",
+                    )
+
             # -----------------------------------------------------------------
             # Step 2
             with gr.Row(equal_height=False):
@@ -1609,12 +1661,28 @@ with gr.Blocks(title="Video Summarizer") as demo:
                     stats_md, summary_md, gallery, segments_table, kept_md, render_md,
                     renders_table, render_ids_state, videos_table, video_ids_state,
                     transcripts_table, summarise_msg]
-    upload.upload(on_upload, [upload, project_state, video_name_box], open_outputs, api_name="upload",
-                  show_progress_on=[videos_msg])
-    download_btn.click(on_download, [url_box, max_height, project_state, video_name_box], open_outputs,
-                       api_name="download", show_progress_on=[videos_msg])
-    url_box.submit(on_download, [url_box, max_height, project_state, video_name_box], open_outputs,
-                   show_progress_on=[videos_msg])
+    upload.upload(
+        on_upload,
+        [upload, project_state, video_name_box],
+        open_outputs,
+        api_name="upload",
+        show_progress="full",
+    )
+    # Use Gradio's full progress UI for long YouTube downloads. The on_download()
+    # callback already forwards yt-dlp progress through gr.Progress().
+    download_btn.click(
+        on_download,
+        [url_box, max_height, project_state, video_name_box],
+        open_outputs,
+        api_name="download",
+        show_progress="full",
+    )
+    url_box.submit(
+        on_download,
+        [url_box, max_height, project_state, video_name_box],
+        open_outputs,
+        show_progress="full",
+    )
     rename_btn.click(on_rename_video,
                      [video_ids_state, video_row_state, rename_box, project_state, video_search],
                      [videos_table, video_ids_state, rename_box, videos_msg], api_name="rename_video")
@@ -1626,7 +1694,14 @@ with gr.Blocks(title="Video Summarizer") as demo:
                              [nav, videos_table, video_ids_state, project_header_md])
     process_btn.click(on_process, [job_state, video_state, whisper_choice, language],
                       [transcript_md, transcript_box, preview_btn, transcripts_table, session_md],
-                      api_name="transcribe", show_progress_on=[transcript_md])
+                      api_name="transcribe", show_progress="full")
+    audio_features_btn.click(
+        on_audio_features,
+        [job_state],
+        [audio_features_table, audio_features_status],
+        api_name="audio_features",
+        show_progress="full",
+    )
     preset.input(apply_preset, [preset], [ratio, min_chars, max_chars, pad, merge_gap]) \
           .then(mark_stale, None, [render_btn, stats_md])
     size_mode.input(toggle_size_mode, [size_mode], [ratio, num_sentences], show_progress="hidden")
@@ -1636,14 +1711,14 @@ with gr.Blocks(title="Video Summarizer") as demo:
                       [job_state, video_state, size_mode, ratio, num_sentences, min_chars, max_chars, pad, merge_gap,
                        use_first, model],
                       [stats_md, summary_md, gallery, segments_table, segments_state, settings_state,
-                       kept_md, render_btn], api_name="preview", show_progress_on=[stats_md])
+                       kept_md, render_btn], api_name="preview", show_progress="full")
     segments_table.input(on_table_change, [segments_table, segments_state, job_state], [kept_md],
                          show_progress="hidden")
     render_btn.click(on_render,
                      [job_state, video_state, segments_state, settings_state, segments_table, project_state],
                      [render_md, out_video, out_files, renders_table, render_ids_state,
                       videos_table, video_ids_state, session_md], api_name="render",
-                     show_progress_on=[render_md])
+                     show_progress="full")
     renders_table.select(on_select_render, [render_ids_state], [history_video, history_files],
                          show_progress="hidden")
 
@@ -1651,9 +1726,23 @@ with gr.Blocks(title="Video Summarizer") as demo:
 if __name__ == "__main__":
     if not db.list_users():
         raise SystemExit("No accounts yet. Create one first:\n    python db.py add-user <username>")
+
     demo.queue(default_concurrency_limit=1).launch(
-        server_name="127.0.0.1", inbrowser=True, theme=gr.themes.Soft(), css=CSS,
+        server_name="127.0.0.1",
+        inbrowser=True,
+        theme=gr.themes.Soft(),
+        css=CSS,
         allowed_paths=[str(P.WORKSPACE)],
         auth=db.check_password,
-        auth_message="Sign in to the Video Summarizer",
+        auth_message="Sign in to the Video Summarizer", 
     )
+    # demo.queue(default_concurrency_limit=1).launch(
+    #     server_name="127.0.0.1",
+    #     inbrowser=True,
+    #     share=True,
+    #     theme=gr.themes.Soft(),
+    #     css=CSS,
+    #     allowed_paths=[str(P.WORKSPACE)],
+    #     auth=db.check_password,
+    #     auth_message="Sign in to the Video Summarizer",
+    # )
