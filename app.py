@@ -455,7 +455,7 @@ def on_back_to_videos(project_id, query, request: gr.Request):
 
 
 def on_process(job_id, video_id, whisper_choice, language_name, request: gr.Request,
-               progress=gr.Progress(track_tqdm=True)):
+               progress=gr.Progress()):     # pipeline reports one clean bar; tqdm tracking is off
     user_id, username = _user(request)
     language = LANGUAGES[language_name]
     try:
@@ -1564,15 +1564,17 @@ with gr.Blocks(title="Video Summarizer") as demo:
                     )
 
     # =========================================================================
-    # Existing event wiring — intentionally unchanged.
-    demo.load(on_start, None, [user_state, session_md, projects_table, project_ids_state])
+    # Event wiring. show_progress_on keeps each progress bar on one component;
+    # show_progress="hidden" removes the spinner from instant actions.
+    demo.load(on_start, None, [user_state, session_md, projects_table, project_ids_state],
+              show_progress="hidden")
 
     # screen 1
     project_search.input(on_search_projects, [project_search],
-                         [projects_table, project_ids_state, project_row_state])
+                         [projects_table, project_ids_state, project_row_state], show_progress="hidden")
     projects_refresh.click(on_search_projects, [project_search],
                            [projects_table, project_ids_state, project_row_state], api_name="refresh_projects")
-    projects_table.select(on_select_project, None, [project_row_state])
+    projects_table.select(on_select_project, None, [project_row_state], show_progress="hidden")
     open_project_btn.click(on_open_project, [project_ids_state, project_row_state],
                            [nav, project_state, project_header_md, videos_table, video_ids_state,
                             video_row_state, video_detail_md, selected_video_player], api_name="open_project")
@@ -1588,10 +1590,12 @@ with gr.Blocks(title="Video Summarizer") as demo:
 
     # screen 2
     video_search.input(on_search_videos, [project_state, video_search],
-                       [videos_table, video_ids_state, video_row_state, selected_video_player])
+                       [videos_table, video_ids_state, video_row_state, selected_video_player],
+                       show_progress="hidden")
     videos_refresh.click(on_search_videos, [project_state, video_search],
                          [videos_table, video_ids_state, video_row_state, selected_video_player], api_name="refresh_videos")
-    videos_table.select(on_select_video, [video_ids_state], [video_row_state, video_detail_md, selected_video_player])
+    videos_table.select(on_select_video, [video_ids_state],
+                        [video_row_state, video_detail_md, selected_video_player], show_progress="hidden")
     back_to_projects_btn.click(on_back_to_projects, [project_search],
                                [nav, projects_table, project_ids_state, session_md])
     delete_video_btn.click(on_delete_video,
@@ -1605,38 +1609,43 @@ with gr.Blocks(title="Video Summarizer") as demo:
                     stats_md, summary_md, gallery, segments_table, kept_md, render_md,
                     renders_table, render_ids_state, videos_table, video_ids_state,
                     transcripts_table, summarise_msg]
-    upload.upload(on_upload, [upload, project_state, video_name_box], open_outputs, api_name="upload")
+    upload.upload(on_upload, [upload, project_state, video_name_box], open_outputs, api_name="upload",
+                  show_progress_on=[videos_msg])
     download_btn.click(on_download, [url_box, max_height, project_state, video_name_box], open_outputs,
-                       api_name="download")
-    url_box.submit(on_download, [url_box, max_height, project_state, video_name_box], open_outputs)
+                       api_name="download", show_progress_on=[videos_msg])
+    url_box.submit(on_download, [url_box, max_height, project_state, video_name_box], open_outputs,
+                   show_progress_on=[videos_msg])
     rename_btn.click(on_rename_video,
                      [video_ids_state, video_row_state, rename_box, project_state, video_search],
                      [videos_table, video_ids_state, rename_box, videos_msg], api_name="rename_video")
     open_video_btn.click(on_open_video, [video_ids_state, video_row_state, project_state], open_outputs,
-                         api_name="open_video")
+                         api_name="open_video", show_progress_on=[videos_msg])
 
     # screen 3
     back_to_videos_btn.click(on_back_to_videos, [project_state, video_search],
                              [nav, videos_table, video_ids_state, project_header_md])
     process_btn.click(on_process, [job_state, video_state, whisper_choice, language],
                       [transcript_md, transcript_box, preview_btn, transcripts_table, session_md],
-                      api_name="transcribe")
+                      api_name="transcribe", show_progress_on=[transcript_md])
     preset.input(apply_preset, [preset], [ratio, min_chars, max_chars, pad, merge_gap]) \
           .then(mark_stale, None, [render_btn, stats_md])
-    size_mode.input(toggle_size_mode, [size_mode], [ratio, num_sentences])
+    size_mode.input(toggle_size_mode, [size_mode], [ratio, num_sentences], show_progress="hidden")
     for comp in (size_mode, ratio, num_sentences, min_chars, max_chars, pad, merge_gap, use_first, model):
-        comp.input(mark_stale, None, [render_btn, stats_md])
+        comp.input(mark_stale, None, [render_btn, stats_md], show_progress="hidden")
     preview_btn.click(on_preview,
                       [job_state, video_state, size_mode, ratio, num_sentences, min_chars, max_chars, pad, merge_gap,
                        use_first, model],
                       [stats_md, summary_md, gallery, segments_table, segments_state, settings_state,
-                       kept_md, render_btn], api_name="preview")
-    segments_table.input(on_table_change, [segments_table, segments_state, job_state], [kept_md])
+                       kept_md, render_btn], api_name="preview", show_progress_on=[stats_md])
+    segments_table.input(on_table_change, [segments_table, segments_state, job_state], [kept_md],
+                         show_progress="hidden")
     render_btn.click(on_render,
                      [job_state, video_state, segments_state, settings_state, segments_table, project_state],
                      [render_md, out_video, out_files, renders_table, render_ids_state,
-                      videos_table, video_ids_state, session_md], api_name="render")
-    renders_table.select(on_select_render, [render_ids_state], [history_video, history_files])
+                      videos_table, video_ids_state, session_md], api_name="render",
+                     show_progress_on=[render_md])
+    renders_table.select(on_select_render, [render_ids_state], [history_video, history_files],
+                         show_progress="hidden")
 
 
 if __name__ == "__main__":

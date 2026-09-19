@@ -12,6 +12,7 @@ Every long step takes a `progress(fraction, description)` callback.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import hashlib
 import json
 import os
@@ -260,16 +261,48 @@ def download_url(url: str, max_height: int = 720, progress: ProgressFn = _no_pro
 
 
 # ----------------------------------------------------------------------------- Transcription
-def _transcribe_mlx(audio, repo, language):
+@contextlib.contextmanager
+def _whisper_progress(progress: ProgressFn, base: float = 0.10, span: float = 0.88):
+    """Report mlx-whisper's own progress bar as a single, clean progress value.
+
+    mlx-whisper (and the model downloader) create several tqdm bars. Letting Gradio track tqdm draws
+    them all in one place, on top of each other, so we read the transcription bar ourselves instead.
+    """
+    try:
+        import tqdm as tqdm_module
+    except Exception:
+        yield
+        return
+    original = tqdm_module.tqdm
+
+    class Reporting(original):
+        def update(self, n=1):
+            super().update(n)
+            try:
+                if self.total:
+                    done = min(1.0, self.n / self.total)
+                    progress(base + span * done, f"Transcribing {done:.0%}")
+            except Exception:
+                pass
+
+    tqdm_module.tqdm = Reporting          # mlx-whisper calls tqdm.tqdm(...) at run time
+    try:
+        yield
+    finally:
+        tqdm_module.tqdm = original
+
+
+def _transcribe_mlx(audio, repo, language, progress: ProgressFn = _no_progress):
     import mlx_whisper
-    res = mlx_whisper.transcribe(audio, path_or_hf_repo=repo, word_timestamps=True, language=language,
-                                 condition_on_previous_text=False, verbose=False)   # verbose=False -> tqdm bar
+    with _whisper_progress(progress):
+        res = mlx_whisper.transcribe(audio, path_or_hf_repo=repo, word_timestamps=True, language=language,
+                                     condition_on_previous_text=False, verbose=False)
     chunks = [{"text": w["word"], "timestamp": [float(w["start"]), float(w["end"])]}
               for seg in res["segments"] for w in seg.get("words", [])]
     return res["text"].strip(), chunks
 
 
-def _transcribe_hf(audio, repo, language):
+def _transcribe_hf(audio, repo, language, progress: ProgressFn = _no_progress):
     import torch
     from transformers import pipeline
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -298,7 +331,8 @@ def prepare(job: Job, whisper_choice: str, language: Optional[str], progress: Pr
             audio = load_audio_16k(job.video_path)
             progress(0.08, f"Transcribing {len(audio) / 16000 / 60:.1f} min of audio with {repo.split('/')[-1]}"
                            " (first run downloads the model)")
-            text, chunks = (_transcribe_mlx if IS_APPLE_SILICON else _transcribe_hf)(audio, repo, language)
+            text, chunks = (_transcribe_mlx if IS_APPLE_SILICON else _transcribe_hf)(
+                audio, repo, language, progress)
             data = {"text": text, "chunks": chunks}
             cache.write_text(json.dumps(data))
             cached = False
